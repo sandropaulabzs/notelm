@@ -9,7 +9,7 @@ st.set_page_config(page_title="Meu NotebookLM Avançado", layout="wide")
 st.title("📂 Meu NotebookLM - Organizador de Fontes")
 
 # =====================================================================
-# SISTEMA DE SEGURANÇA
+# SISTEMA DE SEGURANÇA (Puxa a chave oculta do servidor do Streamlit)
 api_key = st.secrets.get("GEMINI_API_KEY", "")
 # =====================================================================
 
@@ -103,7 +103,9 @@ st.subheader("💬 Central de Inteligência - Pergunte à sua base")
 # Junta o texto de todos os PDFs para mandar como contexto pro Gemini
 contexto_consolidado = ""
 for nome_arq, dados in st.session_state.banco_de_dados.items():
-    contexto_consolidado += f"\n--- FONTE: {nome_arq} (Categoria: {dados['categoria']}, Assunto: {dados['subassunto']}) ---\n{dados['texto']}\n"
+    # Limitamos o texto de cada PDF a 40.000 caracteres para garantir que não estoura o limite da API
+    texto_limitado = dados['texto'][:40000]
+    contexto_consolidado += f"\n--- FONTE: {nome_arq} (Categoria: {dados['categoria']}, Assunto: {dados['subassunto']}) ---\n{texto_limitado}\n"
 
 # Exibe histórico do chat na tela
 for q, r in st.session_state.historico:
@@ -129,9 +131,13 @@ if pergunta := st.chat_input("O que você deseja saber cruzando essas fontes?"):
                 
                 Pergunta: {pergunta}
                 """
-                response = client.models.generate_content(
-                    model='gemini-2.5-flash',
-                    contents=prompt_final
-                )
-                resposta_placeholder.write(response.text)
-                st.session_state.historico.append((pergunta, response.text))
+                try:
+                    response = client.models.generate_content(
+                        model='gemini-2.5-flash',
+                        contents=prompt_final
+                    )
+                    resposta_placeholder.write(response.text)
+                    st.session_state.historico.append((pergunta, response.text))
+                except Exception as e:
+                    st.error("Ops! O volume de texto enviado foi muito grande para a IA processar de uma vez só ou ocorreu um erro de conexão. Tente fazer o upload de menos arquivos ou arquivos menores.")
+                    st.caption(f"Detalhe do erro: {str(e)}")
