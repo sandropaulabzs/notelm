@@ -10,7 +10,7 @@ st.caption("Faça upload de documentos e converse com eles usando o Gemini.")
 
 # =====================================================================
 # SUA CHAVE DE API FIXA AQUI
-api_key = = st.secrets.get("GEMINI_API_KEY", "")
+api_key = st.secrets.get("GEMINI_API_KEY", "")
 # =====================================================================
 
 # Inicializa o cliente do Gemini com a sua chave fixa
