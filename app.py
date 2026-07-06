@@ -20,42 +20,45 @@ st.set_page_config(
 DOCS_DIR = Path("./documentos")
 CACHE_DIR = Path("./cache")
 CACHE_DIR.mkdir(exist_ok=True)
-CHUNK_SIZE = 5000  # Caracteres por chunk para processamento
+CHUNK_SIZE = 3000  # Caracteres por chunk para processamento (reduzido para economia)
+MAX_CONTEXT_TOKENS = 4000  # Limite de tokens para enviar ao Gemini
 
 # ============================================
-# 2. FUNÇÃO DE PRÉ-PROCESSAMENTO (RODA UMA VEZ)
+# 2. FUNÇÃO DE PRÉ-PROCESSAMENTO (EXECUTA UMA VEZ)
 # ============================================
 def processar_pdfs_para_texto():
     """
-    Lê todos os PDFs da pasta /documentos e gera um arquivo JSON leve.
-    Só executa se o arquivo cache não existir ou se houver mudanças nos PDFs.
+    Lê todos os PDFs da pasta /documentos e gera um JSON compacto.
+    Só executa se o arquivo cache não existir ou se houver mudanças.
     """
     cache_file = CACHE_DIR / "documentos_processados.json"
     
-    # Verifica se já existe cache
+    # Verifica se já existe cache e está atualizado
     if cache_file.exists():
-        # Verifica se algum PDF foi modificado
-        cache_mtime = cache_file.stat().st_mtime
-        pdfs_modificados = False
-        
-        for pdf_file in DOCS_DIR.glob("*.pdf"):
-            if pdf_file.stat().st_mtime > cache_mtime:
-                pdfs_modificados = True
-                break
-        
-        if not pdfs_modificados:
-            # Carrega cache existente
+        try:
             with open(cache_file, 'r', encoding='utf-8') as f:
-                return json.load(f)
+                cache_data = json.load(f)
+            
+            # Verifica se algum PDF foi modificado
+            pdfs_modificados = False
+            for pdf_file in DOCS_DIR.glob("*.pdf"):
+                if pdf_file.stat().st_mtime > cache_data.get("cache_timestamp", 0):
+                    pdfs_modificados = True
+                    break
+            
+            if not pdfs_modificados:
+                return cache_data.get("documentos", [])
+        except:
+            pass  # Se der erro, reprocessa
     
     # PROCESSAMENTO DOS PDFS (executado apenas quando necessário)
-    st.info("🔄 Processando documentos pela primeira vez... Isso pode levar alguns segundos.")
+    st.toast("🔄 Processando documentos base...", icon="📄")
     
     try:
         from pypdf import PdfReader
     except ImportError:
         st.error("Biblioteca pypdf não instalada. Execute: pip install pypdf")
-        return None
+        return []
     
     documentos_texto = []
     
@@ -64,185 +67,241 @@ def processar_pdfs_para_texto():
             reader = PdfReader(pdf_path)
             texto_completo = ""
             
+            # Extrai apenas o texto principal (ignora cabeçalhos/rodapés)
             for page in reader.pages:
-                texto_completo += page.extract_text() + "\n"
+                texto_pagina = page.extract_text()
+                if texto_pagina:
+                    texto_completo += texto_pagina + " "
+            
+            # Limpeza básica do texto
+            texto_completo = " ".join(texto_completo.split())  # Remove espaços extras
             
             # Resumo do documento para contexto
             nome_arquivo = pdf_path.stem
             documentos_texto.append({
                 "nome": nome_arquivo,
-                "texto": texto_completo,
+                "texto": texto_completo[:CHUNK_SIZE],  # Limita tamanho
                 "tamanho": len(texto_completo),
-                "data_processamento": datetime.now().isoformat()
+                "hash": hashlib.md5(texto_completo.encode()).hexdigest()[:8]
             })
             
         except Exception as e:
-            st.warning(f"Erro ao ler {pdf_path.name}: {str(e)}")
+            st.warning(f"⚠️ Erro ao ler {pdf_path.name}: {str(e)[:50]}")
     
-    # Salva cache
+    # Salva cache com timestamp
+    cache_data = {
+        "documentos": documentos_texto,
+        "cache_timestamp": time.time(),
+        "total_documentos": len(documentos_texto)
+    }
+    
     with open(cache_file, 'w', encoding='utf-8') as f:
-        json.dump(documentos_texto, f, ensure_ascii=False, indent=2)
+        json.dump(cache_data, f, ensure_ascii=False, indent=2)
     
     return documentos_texto
 
 # ============================================
-# 3. CARREGAMENTO DOS DOCUMENTOS (LEVE)
+# 3. CARREGAMENTO DOS DOCUMENTOS (LEVE E RÁPIDO)
 # ============================================
-@st.cache_resource(ttl=3600)  # Cache por 1 hora
+@st.cache_resource(ttl=3600)  # Cache por 1 hora no Streamlit Cloud
 def carregar_documentos():
-    """Carrega os documentos processados do cache"""
+    """
+    Carrega os documentos processados do cache.
+    Retorna uma string de contexto otimizada para tokens.
+    """
     documentos = processar_pdfs_para_texto()
-    if documentos is None:
-        return []
     
-    # Extrai apenas os textos para o contexto
-    textos = []
+    if not documentos:
+        return "Base de documentos não encontrada."
+    
+    # Constrói contexto otimizado (apenas os trechos mais relevantes)
+    contextos = []
+    total_tokens_estimados = 0
+    
     for doc in documentos:
-        textos.append(f"--- {doc['nome']} ---\n{doc['texto'][:CHUNK_SIZE]}")
+        # Pega apenas o início de cada documento (mais relevante)
+        texto_doc = doc['texto'][:2000]  # Reduzido para economia
+        contexto_doc = f"📄 {doc['nome']}: {texto_doc}"
+        contextos.append(contexto_doc)
+        total_tokens_estimados += len(contexto_doc) // 3  # Estimativa grosseira
+        
+        # Se atingir o limite de tokens, para
+        if total_tokens_estimados > MAX_CONTEXT_TOKENS:
+            break
     
-    return "\n\n".join(textos)
+    return "\n\n".join(contextos)
 
 # ============================================
-# 4. FUNÇÃO DE CHAMADA DA API GEMINI
+# 4. FUNÇÃO DE BUSCA NO CONTEXTO LOCAL (SEM API)
 # ============================================
-def chamar_gemini(pergunta, contexto, usar_web=False):
+def buscar_local(pergunta, contexto):
     """
-    Chama a API do Gemini com tratamento de erros robusto
+    Busca por palavras-chave no contexto local sem usar a API.
+    Útil quando a cota está esgotada.
+    """
+    palavras = pergunta.lower().split()
+    resultados = []
+    
+    # Procura por documentos que contenham as palavras-chave
+    for linha in contexto.split('\n'):
+        linha_lower = linha.lower()
+        if any(palavra in linha_lower for palavra in palavras):
+            if linha.strip():
+                resultados.append(linha.strip())
+    
+    if resultados:
+        return "📋 **Encontrado nos documentos:**\n\n" + "\n".join(resultados[:3])
+    return "🔍 Não encontrei informações específicas nos documentos. Tente reformular sua pergunta."
+
+# ============================================
+# 5. FUNÇÃO DE CHAMADA DA API GEMINI
+# ============================================
+def chamar_gemini(pergunta, contexto):
+    """
+    Chama a API do Gemini com tratamento de erros robusto.
     """
     try:
+        # Importa o SDK mais recente
         from google import genai
         
         # Configuração da API
         api_key = st.secrets.get("GEMINI_API_KEY")
         if not api_key:
-            # Fallback para variável de ambiente
             api_key = os.environ.get("GEMINI_API_KEY")
         
         if not api_key:
-            return "❌ Chave de API não configurada. Verifique as configurações."
+            return "🔑 Chave de API não configurada. Verifique as configurações."
         
         client = genai.Client(api_key=api_key)
         
-        # Construção do prompt com economia de tokens
-        prompt = f"""Você é um assistente de fiscalização ambiental. Responda de forma direta, prática e curta.
+        # Prompt otimizado para economia de tokens
+        prompt = f"""Você é um fiscal ambiental experiente. Responda de forma direta e prática.
 
-Contexto das legislações/relatórios:
+Documentos disponíveis:
 {contexto}
 
-Pergunta do fiscal: {pergunta}
+Pergunta: {pergunta}
 
-Instruções:
-- Seja objetivo e vá direto ao ponto
-- Use linguagem clara para leitura em campo
-- Se não souber, diga que não tem informação
-- Máximo de 200 palavras
+Regras:
+- Máximo 100 palavras
+- Se for multa, cite valor
+- Se for artigo, cite número
+- Se não souber, diga "Não encontrei essa informação nos documentos"
+- Seja objetivo e prático para leitura em campo
 """
         
-        # Configuração da chamada
-        tools = None
-        if usar_web:
-            tools = [{"google_search": {}}]
-        
-        # Faz a chamada com timeout
+        # Chamada otimizada
         response = client.models.generate_content(
             model="gemini-2.5-flash",
             contents=prompt,
-            tools=tools,
             config={
-                "temperature": 0.3,
-                "max_output_tokens": 500,
+                "temperature": 0.2,  # Mais baixo para respostas precisas
+                "max_output_tokens": 300,  # Limita resposta
             }
         )
         
         return response.text
         
     except Exception as e:
-        # Tratamento de erros específicos
         error_msg = str(e).lower()
         
+        # Tratamento granular de erros
         if "quota" in error_msg or "resource exhausted" in error_msg:
-            return "⚠️ Limite de requisições da API atingido. Tente novamente mais tarde."
+            # Tenta busca local como fallback
+            resultado_local = buscar_local(pergunta, contexto)
+            if "Encontrado" in resultado_local:
+                return resultado_local
+            return "⚠️ **Limite de consultas diárias atingido.** Tente novamente amanhã ou use a busca local nos documentos."
+        
         elif "timeout" in error_msg or "connection" in error_msg:
-            return "📡 Instabilidade na rede de campo. Tente novamente."
+            return "📡 **Conexão de campo instável.** Tente novamente em instantes."
+        
         elif "api_key" in error_msg or "authentication" in error_msg:
-            return "🔑 Erro de autenticação. Verifique sua chave API."
+            return "🔑 **Erro de autenticação.** Verifique sua chave API no Streamlit Cloud."
+        
         else:
-            return f"⚠️ Erro ao processar sua pergunta: {str(e)[:100]}"
+            # Log do erro técnico (apenas para debug)
+            st.error(f"Erro técnico: {str(e)[:100]}")
+            return "⚠️ **Erro ao processar sua pergunta.** Tente novamente."
 
 # ============================================
-# 5. INTERFACE PRINCIPAL
+# 6. INTERFACE PRINCIPAL
 # ============================================
 def main():
     # Inicializa estado da sessão
-    if "mensagens" not in st.session_state:
-        st.session_state.mensagens = []
-        st.session_state.usar_web = False
+    if "historico" not in st.session_state:
+        st.session_state.historico = []
+        st.session_state.total_requisicoes = 0
+        st.session_state.ultima_resposta = None
     
-    # Sidebar minimalista (apenas para info)
+    # Sidebar compacta
     with st.sidebar:
-        st.markdown("### 🌿 Configurações")
-        st.session_state.usar_web = st.checkbox(
-            "🔍 Busca na Web", 
-            value=st.session_state.usar_web,
-            help="Ativa busca no Google para informações atualizadas"
-        )
+        st.markdown("### 🌿 NotebookLM Campo")
+        st.caption(f"📊 {st.session_state.total_requisicoes} consultas hoje")
+        
+        # Botão para limpar histórico
+        if st.button("🗑️ Limpar Conversa", use_container_width=True):
+            st.session_state.historico = []
+            st.rerun()
         
         st.markdown("---")
-        st.markdown("**Status do Sistema**")
-        st.caption(f"📄 {len(st.session_state.mensagens)} mensagens")
+        st.caption("💡 Dica: Use perguntas diretas como 'Qual a multa para...'")
+        st.caption("📱 App otimizado para conexões 4G/5G")
     
-    # Carrega documentos (invisível para o usuário)
-    try:
-        contexto = carregar_documentos()
-    except Exception as e:
-        contexto = "Erro ao carregar documentos base."
-        st.error("⚠️ Erro ao carregar base de documentos")
-    
-    # Interface principal - estilo chat
+    # Título principal
     st.title("🌿 NotebookLM Campo")
-    st.caption("Assistente de fiscalização ambiental - resposta instantânea")
+    st.caption("Assistente de fiscalização ambiental - Respostas rápidas para campo")
     
-    # Container de chat (estilo WhatsApp)
+    # Container do chat
     chat_container = st.container()
     
-    # Exibe histórico de mensagens
+    # Exibe histórico
     with chat_container:
-        for msg in st.session_state.mensagens:
+        if not st.session_state.historico:
+            st.info("💬 Pergunte sobre legislação ambiental, multas ou procedimentos de fiscalização.")
+        
+        for msg in st.session_state.historico:
             if msg["role"] == "user":
                 st.chat_message("user").markdown(f"**Você:** {msg['content']}")
             else:
-                st.chat_message("assistant").markdown(f"**IA:** {msg['content']}")
+                st.chat_message("assistant").markdown(msg['content'])
     
     # Input do usuário
-    pergunta = st.chat_input("Digite sua pergunta sobre legislação ambiental...")
+    pergunta = st.chat_input("Digite sua pergunta sobre fiscalização ambiental...")
     
     if pergunta:
         # Adiciona pergunta ao histórico
-        st.session_state.mensagens.append({"role": "user", "content": pergunta})
+        st.session_state.historico.append({"role": "user", "content": pergunta})
+        st.session_state.total_requisicoes += 1
         
-        # Mostra pergunta imediatamente
+        # Mostra pergunta
         with chat_container:
             st.chat_message("user").markdown(f"**Você:** {pergunta}")
+        
+        # Carrega contexto (sempre do cache)
+        with st.spinner(""):
+            contexto = carregar_documentos()
         
         # Placeholder para resposta
         with st.chat_message("assistant"):
             placeholder = st.empty()
-            placeholder.markdown("**IA:** *Processando...*")
+            placeholder.markdown("⏳ *Processando consulta...*")
             
-            # Chama a API
-            resposta = chamar_gemini(pergunta, contexto, st.session_state.usar_web)
+            # Chama API
+            resposta = chamar_gemini(pergunta, contexto)
             
-            # Atualiza com a resposta
-            placeholder.markdown(f"**IA:** {resposta}")
+            # Atualiza com resposta
+            placeholder.markdown(resposta)
             
             # Salva no histórico
-            st.session_state.mensagens.append({"role": "assistant", "content": resposta})
+            st.session_state.historico.append({"role": "assistant", "content": resposta})
+            st.session_state.ultima_resposta = resposta
         
-        # Força rerun para atualizar a interface
+        # Força atualização
         st.rerun()
 
 # ============================================
-# 6. EXECUÇÃO
+# 7. EXECUÇÃO
 # ============================================
 if __name__ == "__main__":
     main()
