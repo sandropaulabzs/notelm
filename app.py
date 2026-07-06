@@ -3,34 +3,27 @@ from google import genai
 from google.genai import types
 import pypdf
 import json
+import os
 
 st.set_page_config(page_title="Meu NotebookLM Avançado", layout="wide")
 
-st.title("📂 Meu NotebookLM - Organizador de Fontes")
+st.title("📂 Meu NotebookLM - Base de Dados Fixa")
 
 # =====================================================================
-# SISTEMA DE SEGURANÇA (Puxa a chave oculta do servidor do Streamlit)
+# SISTEMA DE SEGURANÇA
 api_key = st.secrets.get("GEMINI_API_KEY", "")
-# =====================================================================
-
 if not api_key:
     st.error("Chave API não configurada nos Secrets do Streamlit.")
     st.stop()
 
 client = genai.Client(api_key=api_key)
+# =====================================================================
 
-# Inicializa estados da memória
+# Inicializa estados da memória se não existirem
 if "banco_de_dados" not in st.session_state:
     st.session_state.banco_de_dados = {}
 if "historico" not in st.session_state:
     st.session_state.historico = []
-
-# Upload de Múltiplos PDFs
-arquivos_carregados = st.file_uploader(
-    "Arraste todos os seus PDFs aqui (Leis, Decretos, Relatórios, etc.)", 
-    type=["pdf"], 
-    accept_multiple_files=True
-)
 
 # Função para a IA categorizar o documento
 def categorizar_documento(texto_inicial, nome_arquivo):
@@ -55,33 +48,63 @@ def categorizar_documento(texto_inicial, nome_arquivo):
     except:
         return {"categoria": "Outros", "subassunto": "Geral"}
 
-# Processar os arquivos carregados
-if arquivos_carregados:
-    novos_arquivos = [f for f in arquivos_carregados if f.name not in st.session_state.banco_de_dados]
+# --- CARREGAMENTO DA BASE DE DADOS FIXA (Pasta 'documentos') ---
+PASTA_DOCS = "documentos"
+if os.path.exists(PASTA_DOCS):
+    arquivos_locais = [f for f in os.listdir(PASTA_DOCS) if f.endswith('.pdf')]
     
-    if novos_arquivos:
-        with st.spinner("A IA está lendo e organizando seus documentos por assunto..."):
-            for arquivo in novos_arquivos:
-                leitor = pypdf.PdfReader(arquivo)
-                texto_completo = ""
-                for pagina in leitor.pages:
-                    texto_completo += pagina.extract_text() or ""
-                
-                # Pede para o Gemini categorizar baseado no começo do texto
-                classificacao = categorizar_documento(texto_completo, arquivo.name)
-                
-                st.session_state.banco_de_dados[arquivo.name] = {
-                    "texto": texto_completo,
-                    "categoria": classificacao.get("categoria", "Outros"),
-                    "subassunto": classificacao.get("subassunto", "Geral")
-                }
-        st.success("Todos os documentos foram organizados!")
+    # Filtra apenas os que ainda não foram processados nesta sessão
+    novos_locais = [f for f in arquivos_locais if f not in st.session_state.banco_de_dados]
+    
+    if novos_locais:
+        with st.spinner("Carregando sua base de dados permanente do GitHub..."):
+            for nome_arq in novos_locais:
+                caminho_completo = os.path.join(PASTA_DOCS, nome_arq)
+                try:
+                    leitor = pypdf.PdfReader(caminho_completo)
+                    texto_completo = ""
+                    for pagina in leitor.pages:
+                        texto_completo += pagina.extract_text() or ""
+                    
+                    classificacao = categorizar_documento(texto_completo, nome_arq)
+                    st.session_state.banco_de_dados[nome_arq] = {
+                        "texto": texto_completo,
+                        "categoria": classification.get("categoria", "Outros"),
+                        "subassunto": classification.get("subassunto", "Geral")
+                    }
+                except Exception as e:
+                    pass
 
-# Exibir a estrutura de pastas organizada na barra lateral (Sidebar)
+# --- CARREGAMENTO DE ARQUIVOS TEMPORÁRIOS (Upload na hora) ---
+arquivos_carregados = st.file_uploader(
+    "Adicionar novos PDFs temporários para esta conversa", 
+    type=["pdf"], 
+    accept_multiple_files=True
+)
+
+if arquivos_carregados:
+    novos_uploads = [f for f in arquivos_carregados if f.name not in st.session_state.banco_de_dados]
+    if novos_uploads:
+        with st.spinner("Processando novos arquivos..."):
+            for arquivo in novos_uploads:
+                try:
+                    leitor = pypdf.PdfReader(arquivo)
+                    texto_completo = ""
+                    for pagina in leitor.pages:
+                        texto_completo += pagina.extract_text() or ""
+                    
+                    classificacao = categorizar_documento(texto_completo, arquivo.name)
+                    st.session_state.banco_de_dados[arquivo.name] = {
+                        "texto": texto_completo,
+                        "categoria": classificacao.get("categoria", "Outros"),
+                        "subassunto": classificacao.get("subassunto", "Geral")
+                    }
+                except:
+                    pass
+
+# --- EXIBIR BIBLIOTECA ORGANIZADA ---
 if st.session_state.banco_de_dados:
-    st.sidebar.header("🗂️ Biblioteca Organizada")
-    
-    # Agrupar por categoria no Python para exibir bonito
+    st.sidebar.header("🗂️ Biblioteca de Fontes")
     categorias = {}
     for nome, dados in st.session_state.banco_de_dados.items():
         cat = dados["categoria"]
@@ -97,17 +120,14 @@ if st.session_state.banco_de_dados:
                 for arq in lista_arquivos:
                     st.caption(f"📄 {arq}")
 
-# Área do Chat e Cruzamento de dados
+# --- CENTRAL DE INTELIGÊNCIA (CHAT) ---
 st.subheader("💬 Central de Inteligência - Pergunte à sua base")
 
-# Junta o texto de todos os PDFs para mandar como contexto pro Gemini
 contexto_consolidado = ""
 for nome_arq, dados in st.session_state.banco_de_dados.items():
-    # Limitamos o texto de cada PDF a 40.000 caracteres para garantir que não estoura o limite da API
     texto_limitado = dados['texto'][:40000]
     contexto_consolidado += f"\n--- FONTE: {nome_arq} (Categoria: {dados['categoria']}, Assunto: {dados['subassunto']}) ---\n{texto_limitado}\n"
 
-# Exibe histórico do chat na tela
 for q, r in st.session_state.historico:
     with st.chat_message("user"): st.write(q)
     with st.chat_message("assistant"): st.write(r)
@@ -117,11 +137,11 @@ if pergunta := st.chat_input("O que você deseja saber cruzando essas fontes?"):
         st.write(pergunta)
         
     if contexto_consolidado == "":
-        st.error("Por favor, faça o upload de pelo menos um PDF primeiro.")
+        st.error("A base de dados está vazia. Adicione PDFs na pasta 'documentos' ou faça o upload.")
     else:
         with st.chat_message("assistant"):
             resposta_placeholder = st.empty()
-            with st.spinner("Analisando todas as legislações e relatórios..."):
+            with st.spinner("Analisando base de dados permanente..."):
                 prompt_final = f"""
                 Você é um assistente fiscal e ambiental especialista. Baseando-se ESTRITAMENTE nas fontes consolidadas abaixo, responda à pergunta do usuário.
                 Sempre cite explicitamente quais arquivos (fontes) continham a informação utilizada para responder.
@@ -139,5 +159,5 @@ if pergunta := st.chat_input("O que você deseja saber cruzando essas fontes?"):
                     resposta_placeholder.write(response.text)
                     st.session_state.historico.append((pergunta, response.text))
                 except Exception as e:
-                    st.error("Ops! O volume de texto enviado foi muito grande para a IA processar de uma vez só ou ocorreu um erro de conexão. Tente fazer o upload de menos arquivos ou arquivos menores.")
-                    st.caption(f"Detalhe do erro: {str(e)}")
+                    st.error("Erro ao processar resposta com a IA.")
+                    st.caption(f"Detalhe: {str(e)}")
