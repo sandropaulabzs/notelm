@@ -2,89 +2,136 @@ import streamlit as st
 from google import genai
 from google.genai import types
 import pypdf
+import json
 
-# Configuração visual da página
-st.set_page_config(page_title="Meu NotebookLM", page_icon="📚", layout="wide")
-st.title("📚 Meu Próprio NotebookLM")
-st.caption("Faça upload de documentos e converse com eles usando o Gemini.")
+st.set_page_config(page_title="Meu NotebookLM Avançado", layout="wide")
+
+st.title("📂 Meu NotebookLM - Organizador de Fontes")
 
 # =====================================================================
-# SUA CHAVE DE API FIXA AQUI
+# SISTEMA DE SEGURANÇA
 api_key = st.secrets.get("GEMINI_API_KEY", "")
 # =====================================================================
 
-# Inicializa o cliente do Gemini com a sua chave fixa
+if not api_key:
+    st.error("Chave API não configurada nos Secrets do Streamlit.")
+    st.stop()
+
 client = genai.Client(api_key=api_key)
 
-# Cria a memória do chat (para ele lembrar o que você já conversou)
-if "messages" not in st.session_state:
-    st.session_state.messages = []
-if "contexto_documento" not in st.session_state:
-    st.session_state.contexto_documento = ""
+# Inicializa estados da memória
+if "banco_de_dados" not in st.session_state:
+    st.session_state.banco_de_dados = {}
+if "historico" not in st.session_state:
+    st.session_state.historico = []
 
-# Barra lateral para fazer Upload
-st.sidebar.header("Fontes de Dados")
-uploaded_file = st.sidebar.file_uploader("Escolha um arquivo PDF", type=["pdf"])
+# Upload de Múltiplos PDFs
+arquivos_carregados = st.file_uploader(
+    "Arraste todos os seus PDFs aqui (Leis, Decretos, Relatórios, etc.)", 
+    type=["pdf"], 
+    accept_multiple_files=True
+)
 
-# Se você colocar um PDF, o programa lê o texto dele
-if uploaded_file is not None and st.session_state.contexto_documento == "":
-    with st.spinner("Lendo e processando o documento..."):
-        leitor_pdf = pypdf.PdfReader(uploaded_file)
-        texto_completo = ""
-        for pagina in leitor_pdf.pages:
-            texto_completo += pagina.extract_text() + "\n"
+# Função para a IA categorizar o documento
+def categorizar_documento(texto_inicial, nome_arquivo):
+    prompt = f"""
+    Analise o seguinte trecho inicial de um documento e classifique-o estritamente em uma Categoria Principal e um Subassunto.
+    Nome do arquivo: {nome_arquivo}
+    Trecho: {texto_inicial[:1500]}
+    
+    Retorne APENAS um JSON no formato abaixo, sem formatação markdown (sem ```json):
+    {{
+        "categoria": "Legislação Municipal ou Legislação Federal ou Relatório Técnico ou Outros",
+        "subassunto": "Ex: Esgotamento Sanitário, Supressão de Vegetação, Poluição Sonora, Licenciamento, Geral"
+    }}
+    """
+    try:
+        response = client.models.generate_content(
+            model='gemini-2.5-flash',
+            contents=prompt,
+            config=types.GenerateContentConfig(response_mime_type="application/json")
+        )
+        return json.loads(response.text)
+    except:
+        return {"categoria": "Outros", "subassunto": "Geral"}
+
+# Processar os arquivos carregados
+if arquivos_carregados:
+    novos_arquivos = [f for f in arquivos_carregados if f.name not in st.session_state.banco_de_dados]
+    
+    if novos_arquivos:
+        with st.spinner("A IA está lendo e organizando seus documentos por assunto..."):
+            for arquivo in novos_arquivos:
+                leitor = pypdf.PdfReader(arquivo)
+                texto_completo = ""
+                for pagina in leitor.pages:
+                    texto_completo += pagina.extract_text() or ""
+                
+                # Pede para o Gemini categorizar baseado no começo do texto
+                classificacao = categorizar_documento(texto_completo, arquivo.name)
+                
+                st.session_state.banco_de_dados[arquivo.name] = {
+                    "texto": texto_completo,
+                    "categoria": classificacao.get("categoria", "Outros"),
+                    "subassunto": classificacao.get("subassunto", "Geral")
+                }
+        st.success("Todos os documentos foram organizados!")
+
+# Exibir a estrutura de pastas organizada na barra lateral (Sidebar)
+if st.session_state.banco_de_dados:
+    st.sidebar.header("🗂️ Biblioteca Organizada")
+    
+    # Agrupar por categoria no Python para exibir bonito
+    categorias = {}
+    for nome, dados in st.session_state.banco_de_dados.items():
+        cat = dados["categoria"]
+        sub = dados["subassunto"]
+        if cat not in categorias: categorias[cat] = {}
+        if sub not in categorias[cat]: categorias[cat][sub] = []
+        categorias[cat][sub].append(nome)
         
-        st.session_state.contexto_documento = texto_completo
-        st.sidebar.success("Documento carregado com sucesso!")
+    for cat, subassuntos in categorias.items():
+        with st.sidebar.expander(f"📁 {cat}", expanded=True):
+            for sub, lista_arquivos in subassuntos.items():
+                st.markdown(f"**🔹 {sub}**")
+                for arq in lista_arquivos:
+                    st.caption(f"📄 {arq}")
 
-# Botão para limpar o documento e começar de novo
-if st.session_state.contexto_documento:
-    if st.sidebar.button("Limpar Documento"):
-        st.session_state.contexto_documento = ""
-        st.session_state.messages = []
-        st.rerun()
+# Área do Chat e Cruzamento de dados
+st.subheader("💬 Central de Inteligência - Pergunte à sua base")
 
-# Mostra o histórico de mensagens na tela
-for message in st.session_state.messages:
-    with st.chat_message(message["role"]):
-        st.markdown(message["content"])
+# Junta o texto de todos os PDFs para mandar como contexto pro Gemini
+contexto_consolidado = ""
+for nome_arq, dados in st.session_state.banco_de_dados.items():
+    contexto_consolidado += f"\n--- FONTE: {nome_arq} (Categoria: {dados['categoria']}, Assunto: {dados['subassunto']}) ---\n{dados['texto']}\n"
 
-# Caixa de texto para você fazer perguntas
-if prompt := st.chat_input("O que você quer saber sobre o documento?"):
-    st.session_state.messages.append({"role": "user", "content": prompt})
+# Exibe histórico do chat na tela
+for q, r in st.session_state.historico:
+    with st.chat_message("user"): st.write(q)
+    with st.chat_message("assistant"): st.write(r)
+
+if pergunta := st.chat_input("O que você deseja saber cruzando essas fontes?"):
     with st.chat_message("user"):
-        st.markdown(prompt)
-
-    # Gera a resposta usando a IA do Gemini
-    with st.chat_message("assistant"):
-        message_placeholder = st.empty()
+        st.write(pergunta)
         
-        # Criamos a regra: O Gemini DEVE responder usando o seu documento
-        if st.session_state.contexto_documento:
-            prompt_sistema = (
-                "Você é um assistente estilo NotebookLM. Seu objetivo é ajudar o usuário a entender as fontes fornecidas.\n"
-                "Responda à pergunta do usuário utilizando estritamente as informações do documento abaixo.\n"
-                f"--- INÍCIO DO DOCUMENTO ---\n{st.session_state.contexto_documento}\n--- FIM DO DOCUMENTO ---"
-            )
-        else:
-            prompt_sistema = "Aviso: Nenhum documento foi carregado pelo usuário ainda. Peça para ele carregar um PDF."
-
-        try:
-            config = types.GenerateContentConfig(
-                system_instruction=prompt_sistema,
-                temperature=0.3,
-            )
-            
-            # Chamada corrigida com o modelo atual gemini-2.5-flash
-            resposta = client.models.generate_content(
-                model='gemini-2.5-flash',
-                contents=prompt,
-                config=config
-            )
-            
-            texto_resposta = resposta.text
-            message_placeholder.markdown(texto_resposta)
-            st.session_state.messages.append({"role": "assistant", "content": texto_resposta})
-            
-        except Exception as e:
-            st.error(f"Erro na API do Gemini: {e}")
+    if contexto_consolidado == "":
+        st.error("Por favor, faça o upload de pelo menos um PDF primeiro.")
+    else:
+        with st.chat_message("assistant"):
+            resposta_placeholder = st.empty()
+            with st.spinner("Analisando todas as legislações e relatórios..."):
+                prompt_final = f"""
+                Você é um assistente fiscal e ambiental especialista. Baseando-se ESTRITAMENTE nas fontes consolidadas abaixo, responda à pergunta do usuário.
+                Sempre cite explicitamente quais arquivos (fontes) continham a informação utilizada para responder.
+                
+                Fontes:
+                {contexto_consolidado}
+                
+                Pergunta: {pergunta}
+                """
+                response = client.models.generate_content(
+                    model='gemini-2.5-flash',
+                    contents=prompt_final
+                )
+                resposta_placeholder.write(response.text)
+                st.session_state.historico.append((pergunta, response.text))
